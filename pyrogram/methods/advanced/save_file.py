@@ -135,24 +135,47 @@ class SaveFile:
 
             file_total_parts = int(math.ceil(file_size / part_size))
             is_big = file_size > 10 * 1024 * 1024
-            workers_count = 4 if is_big else 1
+            workers_count = 4 if is_big else 1      #This value can be changed to get more upload speed (But may cause floodwait/excess load)
             is_missing_part = file_id is not None
             file_id = file_id or self.rnd_id()
             md5_sum = md5() if not is_big and not is_missing_part else None
             dc_id = await self.storage.dc_id()
+            is_bot = await self.storage.is_bot()
+            session_constructed = False
 
-            session = self.media_sessions.get(dc_id)
-            if not session:
-                session = self.media_sessions[dc_id] = Session(
-                    self, dc_id, await self.storage.auth_key(),
-                    await self.storage.test_mode(), is_media=True
-                )
-                await session.start()
+            if not is_bot:      #Use less Sessions in case of Userbot is uploading to avoid Ban of account
+                session = self.media_sessions.get(dc_id)
+            else:
+                pool_size = 3 if is_big else 1     #This value can be changed to get more upload speed (Can cause problem for large number of users)
+            
+            if not is_bot:
+                if not session:
+                    session_constructed = True
+                    session = self.media_sessions[dc_id] = Session(
+                        self, dc_id, await self.storage.auth_key(),
+                        await self.storage.test_mode(), is_media=True
+                    )
 
-            workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
-            queue = asyncio.Queue(1)
+                workers = [self.loop.create_task(worker(session)) for _ in range(workers_count)]
+                queue = asyncio.Queue(1)
+            else:
+                pool = [
+                    Session(
+                        self, dc_id, await self.storage.auth_key(),
+                        await self.storage.test_mode(), is_media=True
+                    ) for _ in range(pool_size)
+                ]
+                workers = [self.loop.create_task(worker(session)) for session in pool for _ in range(workers_count)]
+                queue = asyncio.Queue(16)
+
 
             try:
+                if not is_bot and session_constructed:
+                    await session.start()
+                elif is_bot:
+                    for session in pool:
+                        await session.start()
+
                 fp.seek(part_size * file_part)
 
                 while True:
@@ -223,6 +246,10 @@ class SaveFile:
                     await queue.put(None)
 
                 await asyncio.gather(*workers)
+
+                if is_bot:
+                    for session in pool:
+                        await session.stop()
 
                 if isinstance(path, (str, PurePath)):
                     fp.close()
