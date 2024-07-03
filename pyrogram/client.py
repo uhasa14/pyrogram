@@ -946,21 +946,17 @@ class Client(Methods):
             offset_bytes = abs(offset) * chunk_size
 
             dc_id = file_id.dc_id
+            session = self.media_sessions.get(dc_id, None)
 
             try:
-                session = self.media_sessions.get(dc_id)
-                if not session:
-                    session = self.media_sessions[dc_id] = Session(
-                        self, dc_id,
-                        await Auth(self, dc_id, await self.storage.test_mode()).create()
-                        if dc_id != await self.storage.dc_id()
-                        else await self.storage.auth_key(),
-                        await self.storage.test_mode(),
-                        is_media=True
-                    )
-                    await session.start()
-
+                if session is None:
                     if dc_id != await self.storage.dc_id():
+                        session = Session(
+                            self, dc_id, await Auth(self, dc_id, await self.storage.test_mode()).create(),
+                            await self.storage.test_mode(), is_media=True
+                        )
+                        await session.start()
+
                         for _ in range(3):
                             exported_auth = await self.invoke(
                                 raw.functions.auth.ExportAuthorization(
@@ -980,7 +976,16 @@ class Client(Methods):
                             else:
                                 break
                         else:
+                            await session.stop()
                             raise AuthBytesInvalid
+                    else:
+                        session = Session(
+                            self, dc_id, await self.storage.auth_key(),
+                            await self.storage.test_mode(), is_media=True
+                        )
+                        await session.start()
+
+                    self.media_sessions[dc_id] = session
 
                 r = await session.invoke(
                     raw.functions.upload.GetFile(
@@ -1028,13 +1033,18 @@ class Client(Methods):
                         )
 
                 elif isinstance(r, raw.types.upload.FileCdnRedirect):
-                    cdn_session = Session(
-                        self, r.dc_id, await Auth(self, r.dc_id, await self.storage.test_mode()).create(),
-                        await self.storage.test_mode(), is_media=True, is_cdn=True
-                    )
+                    cdn_session = self.media_sessions.get(r.dc_id, None)
 
                     try:
-                        await cdn_session.start()
+                        if cdn_session is None:
+                            cdn_session = Session(
+                                self, r.dc_id, await Auth(self, r.dc_id, await self.storage.test_mode()).create(),
+                                await self.storage.test_mode(), is_media=True, is_cdn=True
+                            )
+
+                            await cdn_session.start()
+
+                            self.media_sessions[r.dc_id] = cdn_session
 
                         while True:
                             r2 = await cdn_session.invoke(
@@ -1107,8 +1117,6 @@ class Client(Methods):
                                 break
                     except Exception as e:
                         raise e
-                    finally:
-                        await cdn_session.stop()
             except pyrogram.StopTransmission:
                 raise
             except (FloodWait, FloodPremiumWait):
